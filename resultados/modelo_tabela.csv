@@ -1,0 +1,8 @@
+tecnica,modo,OK,CORROMPIDO,PERDIDO,NAO_DETECTADO,TOTAL,taxa_nao_deteccao,calculo_tx_medio_us,verificacao_rx_media_us,overhead_bytes,recuperacao_media_ms
+CRC16_CCITT,0,,,,,1000,,,,10,
+CRC16_CCITT,1,,,,,1000,,,,10,
+CRC16_CCITT,2,,,,,1000,,,,10,
+CRC16_CCITT,3,,,,,1000,,,,10,
+FLETCHER16,1,,,,,1000,,,,10,
+FLETCHER16,2,,,,,1000,,,,10,
+FLETCHER16,3,,,,,1000,,,,10,
