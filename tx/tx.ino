@@ -3,7 +3,8 @@
  * Pino fisico usado: TX2 (GPIO 17). RX2 e inicializado, mas nao e conectado.
  *
  * Monitor Serial (115200): c=CRC-16, f=Fletcher-16, 0..3=modo,
- * r=rodar 1000 quadros, ?=mostrar configuracao.
+ * r=rodar 1000 quadros, p<sequencia>=mostrar quadro original,
+ * ?=mostrar configuracao.
  */
 
 #include <Arduino.h>
@@ -22,6 +23,10 @@ enum Technique : uint8_t { TECH_CRC16 = 1, TECH_FLETCHER16 = 2 };
 Technique selectedTechnique = TECH_CRC16;
 uint8_t declaredNoiseMode = 0;
 bool experimentRunning = false;
+bool readingFrameSequence = false;
+bool haveFrameSequenceDigit = false;
+bool invalidFrameSequence = false;
+uint16_t requestedFrameSequence = 0;
 
 struct TimingStats {
   uint32_t minimumUs = UINT32_MAX;
@@ -81,12 +86,11 @@ void makePayload(uint16_t sequence, uint8_t payload[PAYLOAD_LENGTH]) {
   payload[3] = lowByte(temperatureCenti);
 }
 
-uint32_t buildAndSendFrame(uint16_t sequence) {
+uint32_t buildFrame(uint16_t sequence, uint8_t frame[14]) {
   uint8_t payload[PAYLOAD_LENGTH];
   makePayload(sequence, payload);
 
   // SOF | LENGTH | VERSION | TECH | MODE | SEQ(2) | PAYLOAD_LEN | PAYLOAD(4) | CODE
-  uint8_t frame[14];
   const uint8_t bytesAfterLength = 1 + 1 + 1 + 2 + 1 + PAYLOAD_LENGTH + 2;
   frame[0] = SOF;
   frame[1] = bytesAfterLength;
@@ -111,17 +115,33 @@ uint32_t buildAndSendFrame(uint16_t sequence) {
     frame[13] = lowByte(check);
   }
   const uint32_t calculationTimeUs = micros() - calculationStartedUs;
-  Serial2.write(frame, 2 + bytesAfterLength);
+  return calculationTimeUs;
+}
+
+uint32_t buildAndSendFrame(uint16_t sequence) {
+  uint8_t frame[14];
+  const uint32_t calculationTimeUs = buildFrame(sequence, frame);
+  Serial2.write(frame, sizeof(frame));
 
   // Copia verdadeira, enviada depois da decisao e fora da regiao protegida.
   const uint8_t debugCopy[12] = {
       DEBUG_SOF, 10, PROTOCOL_VERSION, static_cast<uint8_t>(selectedTechnique),
       declaredNoiseMode, highByte(sequence), lowByte(sequence), PAYLOAD_LENGTH,
-      payload[0], payload[1], payload[2], payload[3]
+      frame[8], frame[9], frame[10], frame[11]
   };
   Serial2.write(debugCopy, sizeof(debugCopy));
   Serial2.flush();
   return calculationTimeUs;
+}
+
+void printOriginalFrame(uint16_t sequence) {
+  uint8_t frame[14];
+  buildFrame(sequence, frame);
+  Serial.printf("QUADRO_ORIGINAL,tecnica=%s,modo=%u,seq=%u,hex=",
+                techniqueName(selectedTechnique), declaredNoiseMode, sequence);
+  for (uint8_t index = 0; index < sizeof(frame); ++index) {
+    Serial.printf("%02X%s", frame[index], index + 1 == sizeof(frame) ? "\n" : " ");
+  }
 }
 
 void printConfiguration() {
@@ -188,13 +208,37 @@ void setup() {
   Serial2.begin(BAUD_RATE, SERIAL_8N1, RX2_PIN, TX2_PIN);
   delay(500);
   selfTest();
-  Serial.println("TX pronto: c=CRC, f=Fletcher, 0..3=modo, r=rodar, ?=status");
+  Serial.println("TX pronto: c=CRC, f=Fletcher, 0..3=modo, r=rodar, p<seq>=quadro, ?=status");
   printConfiguration();
 }
 
 void loop() {
   if (experimentRunning || !Serial.available()) return;
   const char command = static_cast<char>(Serial.read());
+  if (readingFrameSequence) {
+    if (command >= '0' && command <= '9') {
+      if (!invalidFrameSequence) {
+        const uint32_t nextSequence = requestedFrameSequence * 10UL + (command - '0');
+        if (nextSequence >= FRAMES_PER_RUN) invalidFrameSequence = true;
+        else requestedFrameSequence = static_cast<uint16_t>(nextSequence);
+      }
+      haveFrameSequenceDigit = true;
+    } else if (command == '\n' || command == '\r') {
+      if (haveFrameSequenceDigit && !invalidFrameSequence) printOriginalFrame(requestedFrameSequence);
+      else Serial.println("ERRO,uso=p<sequencia_de_0_a_999> e Enter");
+      readingFrameSequence = false;
+    } else {
+      invalidFrameSequence = true;
+    }
+    return;
+  }
+  if (command == 'p' || command == 'P') {
+    readingFrameSequence = true;
+    haveFrameSequenceDigit = false;
+    invalidFrameSequence = false;
+    requestedFrameSequence = 0;
+    return;
+  }
   if (command == 'c' || command == 'C') {
     selectedTechnique = TECH_CRC16;
     printConfiguration();

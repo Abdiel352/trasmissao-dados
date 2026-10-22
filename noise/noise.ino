@@ -20,6 +20,9 @@ static const uint8_t DEBUG_SOF = 0x5A;
 static const uint8_t CRC_BODY_LENGTH = 12;
 static const uint8_t DEBUG_BODY_LENGTH = 10;
 static const uint8_t PAYLOAD_LENGTH = 4;
+static const uint8_t PAYLOAD_FIRST_BYTE_AFTER_SOF = 8;
+static const uint8_t SOF_OBSERVATION_LATENCY_PERIODS = 10;
+static const uint32_t PARSER_TIMEOUT_US = 3000;
 
 enum NoiseParserState : uint8_t {
   FIND_MAIN,
@@ -51,8 +54,12 @@ esp_timer_handle_t startTimers[2];
 esp_timer_handle_t endTimers[2];
 NoiseParserState parserState = FIND_MAIN;
 uint8_t bytesRemaining = 0;
+uint8_t mainBodyOffset = 0;
+uint8_t sequenceHighByte = 0;
+uint32_t lastObservedByteUs = 0;
 uint8_t noiseMode = 0;  // 0..3 normais; 4 = demonstracao especial.
 uint16_t predictedSequence = 0;
+uint16_t plannedSequence = 0;
 uint32_t timingAdvanceUs = 8;
 
 const char *noiseModeName(uint8_t mode) {
@@ -66,7 +73,11 @@ uint32_t bitPeriodsToUs(uint32_t periods) {
 
 uint32_t delayToDataBit(uint8_t frameByteAfterSof, uint8_t dataBit) {
   // Cada byte UART: start + 8 bits LSB-first + stop = 10 periodos.
-  uint32_t delayUs = bitPeriodsToUs(frameByteAfterSof * 10UL + 1UL + dataBit);
+  // Serial2 disponibiliza o SOF somente depois do seu stop bit. Por isso,
+  // descontamos um byte UART para obter o atraso a partir desse instante.
+  const uint32_t targetPeriods = frameByteAfterSof * 10UL + 1UL + dataBit;
+  if (targetPeriods <= SOF_OBSERVATION_LATENCY_PERIODS) return 1;
+  uint32_t delayUs = bitPeriodsToUs(targetPeriods - SOF_OBSERVATION_LATENCY_PERIODS);
   return delayUs > timingAdvanceUs ? delayUs - timingAdvanceUs : 1;
 }
 
@@ -122,7 +133,7 @@ void planInjection() {
   if (noiseMode == 1 || noiseMode == 2) {
     const uint8_t payloadIndex1 = random(0, PAYLOAD_LENGTH);
     const uint8_t bit1 = random(0, 8);
-    const uint8_t frameByte1 = 7 + payloadIndex1;
+    const uint8_t frameByte1 = PAYLOAD_FIRST_BYTE_AFTER_SOF + payloadIndex1;
     const uint8_t mask1 = (payload[payloadIndex1] & (1U << bit1)) ? (1U << bit1) : 0;
     armEvent(0, predictedSequence, noiseMode, frameByte1, bit1, 1, mask1);
 
@@ -134,7 +145,7 @@ void planInjection() {
       do {
         payloadIndex2 = random(0, PAYLOAD_LENGTH);
         bit2 = random(0, 8);
-        frameByte2 = 7 + payloadIndex2;
+        frameByte2 = PAYLOAD_FIRST_BYTE_AFTER_SOF + payloadIndex2;
       } while (abs(static_cast<int32_t>(frameByte2 * 10UL + bit2) -
                         static_cast<int32_t>(firstPosition)) < 2);
       const uint8_t mask2 = (payload[payloadIndex2] & (1U << bit2)) ? (1U << bit2) : 0;
@@ -148,15 +159,15 @@ void planInjection() {
     for (uint8_t bit = firstBit; bit < firstBit + bitCount; ++bit) {
       if (payload[payloadIndex] & (1U << bit)) changedMask |= (1U << bit);
     }
-    armEvent(0, predictedSequence, noiseMode, 7 + payloadIndex,
+    armEvent(0, predictedSequence, noiseMode, PAYLOAD_FIRST_BYTE_AFTER_SOF + payloadIndex,
              firstBit, bitCount, changedMask);
   } else if (noiseMode == 4) {
     // No Fletcher-16, 0xFF e 0x00 sao equivalentes modulo 255.
     // Uma rajada de 8 bits que transforma FF em 00 passa sem deteccao.
     if (payload[1] == 0xFF) {
-      armEvent(0, predictedSequence, noiseMode, 8, 0, 8, 0xFF);
+      armEvent(0, predictedSequence, noiseMode, PAYLOAD_FIRST_BYTE_AFTER_SOF + 1, 0, 8, 0xFF);
     } else if (payload[3] == 0xFF) {
-      armEvent(0, predictedSequence, noiseMode, 10, 0, 8, 0xFF);
+      armEvent(0, predictedSequence, noiseMode, PAYLOAD_FIRST_BYTE_AFTER_SOF + 3, 0, 8, 0xFF);
     }
   }
   predictedSequence = static_cast<uint16_t>(predictedSequence + 1);
@@ -172,23 +183,26 @@ void reportFinishedEvents() {
     event.active = false;
     event.finished = false;
     interrupts();
-    Serial.printf("INJECAO,seq=%u,modo=%s,byte_quadro=%u,bits=%u..%u,timestamp_us=%lld,duracao_us=%lu,linha_alta_antes=%s,mudou_no_inicio=%s,mascara_prevista=0x%02X\n",
+    Serial.printf("INJECAO,%u,%s,%u,%u..%u,%lld,%lu,%s,0x%02X\n",
                   event.sequence, noiseModeName(event.selectedMode),
                   event.frameByte, event.firstBit,
                   event.firstBit + event.bitCount - 1,
                   static_cast<long long>(actualStartUs),
                   static_cast<unsigned long>(event.durationUs),
-                  lineWasHighAtStart ? "SIM" : "NAO",
                   lineWasHighAtStart ? "SIM" : "NAO", event.changedMask);
   }
 }
 
 void beginMainFrame() {
+  // Bytes seguintes no buffer Serial2 sao normais e nao impedem a injecao.
+  // O alvo nominal e um byte do payload; a posicao real requer calibracao.
+  plannedSequence = predictedSequence;
   planInjection();
   parserState = READ_MAIN_LENGTH;
 }
 
 void processObservedByte(uint8_t value) {
+  lastObservedByteUs = micros();
   switch (parserState) {
     case FIND_MAIN:
       if (value == SOF) beginMainFrame();
@@ -197,6 +211,7 @@ void processObservedByte(uint8_t value) {
     case READ_MAIN_LENGTH:
       if (value == CRC_BODY_LENGTH) {
         bytesRemaining = value;
+        mainBodyOffset = 0;
         parserState = SKIP_MAIN_BODY;
       } else {
         parserState = FIND_MAIN;
@@ -204,6 +219,27 @@ void processObservedByte(uint8_t value) {
       break;
 
     case SKIP_MAIN_BODY:
+      // O numero de sequencia ocupa os bytes 3 e 4 do corpo (apos a versao,
+      // tecnica e modo). Ele realinha a contagem mesmo depois de um SOF perdido.
+      if (mainBodyOffset == 3) sequenceHighByte = value;
+      else if (mainBodyOffset == 4) {
+        const uint16_t actualSequence = word(sequenceHighByte, value);
+        predictedSequence = static_cast<uint16_t>(actualSequence + 1);
+        uint8_t payload[PAYLOAD_LENGTH];
+        makePayload(actualSequence, payload);
+        for (uint8_t index = 0; index < 2; ++index) {
+          PulseEvent &event = events[index];
+          if (!event.active || event.sequence != plannedSequence) continue;
+          event.sequence = actualSequence;
+          const uint8_t payloadIndex = event.frameByte - PAYLOAD_FIRST_BYTE_AFTER_SOF;
+          uint8_t mask = 0;
+          for (uint8_t bit = event.firstBit; bit < event.firstBit + event.bitCount; ++bit) {
+            if (payload[payloadIndex] & (1U << bit)) mask |= (1U << bit);
+          }
+          event.changedMask = mask;
+        }
+      }
+      ++mainBodyOffset;
       if (--bytesRemaining == 0) parserState = FIND_DEBUG;
       break;
 
@@ -222,7 +258,12 @@ void processObservedByte(uint8_t value) {
       break;
 
     case SKIP_DEBUG_BODY:
-      if (--bytesRemaining == 0) parserState = FIND_MAIN;
+      if (--bytesRemaining == 0) {
+        parserState = FIND_MAIN;
+        // Registra o pulso deste quadro antes que o proximo SOF reutilize
+        // o mesmo slot de evento e apague o log anterior.
+        reportFinishedEvents();
+      }
       break;
   }
 }
@@ -245,6 +286,9 @@ void readCommands() {
     } else if (command == 'r' || command == 'R') {
       predictedSequence = 0;
       parserState = FIND_MAIN;
+      bytesRemaining = 0;
+      mainBodyOffset = 0;
+      lastObservedByteUs = 0;
       Serial.println("NOISE,sequencia_e_parser_reiniciados");
     } else if (command == '+') {
       ++timingAdvanceUs;
@@ -285,6 +329,13 @@ void setup() {
 
 void loop() {
   readCommands();
+  if (parserState != FIND_MAIN && lastObservedByteUs != 0 &&
+      micros() - lastObservedByteUs > PARSER_TIMEOUT_US) {
+    parserState = FIND_MAIN;
+    bytesRemaining = 0;
+    mainBodyOffset = 0;
+    Serial.println("NOISE,parser_ressincronizado_apos_timeout");
+  }
   while (Serial2.available()) processObservedByte(static_cast<uint8_t>(Serial2.read()));
   reportFinishedEvents();
 }

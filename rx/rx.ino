@@ -6,6 +6,7 @@
  *   r = preparar uma nova rodada (mantem tabelas acumuladas)
  *   t = imprimir as tabelas
  *   x = apagar todas as tabelas e preparar nova rodada
+ *   p<sequencia> = mostrar os 14 bytes recebidos naquela sequencia
  */
 
 #include <Arduino.h>
@@ -20,6 +21,8 @@ static const uint8_t PAYLOAD_LENGTH = 4;
 static const uint8_t CRC_BODY_LENGTH = 12;
 static const uint8_t DEBUG_BODY_LENGTH = 10;
 static const uint8_t MAX_BODY_LENGTH = 16;
+static const uint8_t MAIN_FRAME_BYTES = 14;
+static const uint16_t FRAMES_PER_RUN = 1000;
 static const uint32_t INSIDE_FRAME_TIMEOUT_US = 3000;
 static const uint32_t INTERFRAME_TIMEOUT_US = 50000;
 
@@ -51,12 +54,14 @@ struct ResultStats {
 
 struct PendingMain {
   bool present = false;
+  bool rawComplete = false;
   bool concludedCheck = false;
   bool checkPassed = false;
   uint8_t technique = 0;
   uint8_t mode = 0;
   uint16_t receivedSequence = 0;
   uint8_t payload[PAYLOAD_LENGTH] = {0};
+  uint8_t rawFrame[MAIN_FRAME_BYTES] = {0};
   uint16_t residue = 0;
   uint32_t verificationUs = 0;
 };
@@ -68,6 +73,12 @@ uint8_t expectedBodyLength = 0;
 uint8_t bodyIndex = 0;
 uint32_t lastParserByteUs = 0;
 PendingMain pendingMain;
+uint8_t receivedFrames[FRAMES_PER_RUN][MAIN_FRAME_BYTES];
+bool receivedFrameAvailable[FRAMES_PER_RUN];
+bool readingFrameSequence = false;
+bool haveFrameSequenceDigit = false;
+bool invalidFrameSequence = false;
+uint16_t requestedFrameSequence = 0;
 ResultStats tableStats[2][4];
 TimingStats rxIntervalStats;
 uint32_t previousMainMarkerUs = 0;
@@ -140,6 +151,9 @@ void markMalformedMain() {
 void evaluateMain() {
   pendingMain = PendingMain();
   pendingMain.present = true;
+  pendingMain.rawComplete = true;
+  pendingMain.rawFrame[0] = SOF;
+  memcpy(&pendingMain.rawFrame[1], mainBytes, 1 + CRC_BODY_LENGTH);
 
   const uint8_t length = mainBytes[0];
   const uint8_t version = mainBytes[1];
@@ -209,6 +223,20 @@ void printAllTables() {
   }
 }
 
+void printReceivedFrame(uint16_t sequence) {
+  if (!receivedFrameAvailable[sequence]) {
+    Serial.printf("QUADRO_RECEBIDO,seq=%u,indisponivel=quadro_principal_nao_montado\n", sequence);
+    return;
+  }
+  const uint8_t *frame = receivedFrames[sequence];
+  const uint16_t headerSequence = word(frame[5], frame[6]);
+  Serial.printf("QUADRO_RECEBIDO,seq_referencia=%u,seq_cabecalho=%u,hex=",
+                sequence, headerSequence);
+  for (uint8_t index = 0; index < MAIN_FRAME_BYTES; ++index) {
+    Serial.printf("%02X%s", frame[index], index + 1 == MAIN_FRAME_BYTES ? "\n" : " ");
+  }
+}
+
 void recordResult(uint8_t technique, uint8_t mode, uint16_t sequence,
                   ResultStatus status, bool payloadMatches, uint16_t residue,
                   bool hasVerification, uint32_t verificationUs) {
@@ -248,6 +276,14 @@ void recordResult(uint8_t technique, uint8_t mode, uint16_t sequence,
 
 bool accountDebugSequence(uint8_t technique, uint8_t mode, uint16_t sequence) {
   if (!haveExpectedSequence) {
+    // Cada rodada do transmissor sempre comeca em 0. Se a primeira copia de
+    // depuracao recebida ja traz uma sequencia maior, os quadros iniciais
+    // foram perdidos antes de o RX conseguir se sincronizar e tambem devem
+    // entrar na tabela.
+    for (uint16_t missingSequence = 0; missingSequence < sequence; ++missingSequence) {
+      recordResult(technique, mode, missingSequence,
+                   STATUS_LOST, false, 0, false, 0);
+    }
     expectedSequence = static_cast<uint16_t>(sequence + 1);
     haveExpectedSequence = true;
     return true;
@@ -287,9 +323,24 @@ void evaluateDebug() {
     return;
   }
 
+  // Depois do primeiro quadro valido, tecnica e modo fazem parte da
+  // configuracao da rodada. A copia de depuracao nao e protegida: se esses
+  // campos forem alterados pelo ruido, ela nao pode criar resultados em outra
+  // tabela nem trocar a referencia usada pelos timeouts.
+  if (runActive && (technique != lastReferenceTechnique || mode != lastReferenceMode)) {
+    Serial.printf("AVISO,copia_de_depuracao_com_configuracao_invalida,tecnica=%u,modo=%u,esperado_tecnica=%u,esperado_modo=%u\n",
+                  technique, mode, lastReferenceTechnique, lastReferenceMode);
+    pendingMain = PendingMain();
+    return;
+  }
+
   if (!accountDebugSequence(technique, mode, trueSequence)) {
     pendingMain = PendingMain();
     return;
+  }
+  if (trueSequence < FRAMES_PER_RUN && pendingMain.rawComplete) {
+    memcpy(receivedFrames[trueSequence], pendingMain.rawFrame, MAIN_FRAME_BYTES);
+    receivedFrameAvailable[trueSequence] = true;
   }
   runActive = true;
   lastReferenceFrameUs = micros();
@@ -391,6 +442,8 @@ void prepareNewRun(bool clearTables) {
   }
   resetParser();
   pendingMain = PendingMain();
+  memset(receivedFrameAvailable, 0, sizeof(receivedFrameAvailable));
+  readingFrameSequence = false;
   haveExpectedSequence = false;
   expectedSequence = 0;
   waitingForRecovery = false;
@@ -407,7 +460,7 @@ void setup() {
   Serial2.begin(BAUD_RATE, SERIAL_8N1, RX2_PIN, TX2_PIN);
   delay(500);
   Serial.println("tecnica,modo,sequencia,residuo,decisao,payload_confere,verificacao_us,recuperacao_us");
-  Serial.println("RX pronto: r=nova rodada, t=tabelas, x=limpar tudo");
+  Serial.println("RX pronto: r=nova rodada, t=tabelas, x=limpar tudo, p<seq>=quadro recebido");
   prepareNewRun(true);
 }
 
@@ -431,6 +484,30 @@ void loop() {
 
   while (Serial.available()) {
     const char command = static_cast<char>(Serial.read());
+    if (readingFrameSequence) {
+      if (command >= '0' && command <= '9') {
+        if (!invalidFrameSequence) {
+          const uint32_t nextSequence = requestedFrameSequence * 10UL + (command - '0');
+          if (nextSequence >= FRAMES_PER_RUN) invalidFrameSequence = true;
+          else requestedFrameSequence = static_cast<uint16_t>(nextSequence);
+        }
+        haveFrameSequenceDigit = true;
+      } else if (command == '\n' || command == '\r') {
+        if (haveFrameSequenceDigit && !invalidFrameSequence) printReceivedFrame(requestedFrameSequence);
+        else Serial.println("ERRO,uso=p<sequencia_de_0_a_999> e Enter");
+        readingFrameSequence = false;
+      } else {
+        invalidFrameSequence = true;
+      }
+      continue;
+    }
+    if (command == 'p' || command == 'P') {
+      readingFrameSequence = true;
+      haveFrameSequenceDigit = false;
+      invalidFrameSequence = false;
+      requestedFrameSequence = 0;
+      continue;
+    }
     if (command == 'r' || command == 'R') prepareNewRun(false);
     else if (command == 'x' || command == 'X') prepareNewRun(true);
     else if (command == 't' || command == 'T') printAllTables();
